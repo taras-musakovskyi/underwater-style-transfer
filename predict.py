@@ -89,16 +89,72 @@ class UNetGenerator(nn.Module):
 
         return self.final(u7)
 
-# ============ CycleGAN Generator (Placeholder) ============
-class ResNetGenerator(nn.Module):
-    """ResNet Generator for CycleGAN (future implementation)"""
-    def __init__(self):
+# ============ CycleGAN ResNet Generator ============
+class ResidualBlock(nn.Module):
+    """Residual block for CycleGAN generator"""
+    def __init__(self, channels):
         super().__init__()
-        # Placeholder - will be implemented when CycleGAN training succeeds
-        pass
+        self.block = nn.Sequential(
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(channels, channels, 3),
+            nn.InstanceNorm2d(channels),
+            nn.ReLU(inplace=True),
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(channels, channels, 3),
+            nn.InstanceNorm2d(channels)
+        )
 
     def forward(self, x):
-        raise NotImplementedError("CycleGAN model not available yet")
+        return x + self.block(x)
+
+class ResNetGenerator(nn.Module):
+    """ResNet Generator for CycleGAN (512×512×3 RGB)"""
+    def __init__(self, in_channels=3, out_channels=3, n_residual_blocks=9):
+        super().__init__()
+
+        # Initial convolution
+        model = [
+            nn.ReflectionPad2d(3),
+            nn.Conv2d(in_channels, 64, 7),
+            nn.InstanceNorm2d(64),
+            nn.ReLU(inplace=True)
+        ]
+
+        # Downsampling (512 → 256 → 128)
+        model += [
+            nn.Conv2d(64, 128, 3, stride=2, padding=1),
+            nn.InstanceNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 256, 3, stride=2, padding=1),
+            nn.InstanceNorm2d(256),
+            nn.ReLU(inplace=True)
+        ]
+
+        # Residual blocks (128×128×256)
+        for _ in range(n_residual_blocks):
+            model += [ResidualBlock(256)]
+
+        # Upsampling (128 → 256 → 512)
+        model += [
+            nn.ConvTranspose2d(256, 128, 3, stride=2, padding=1, output_padding=1),
+            nn.InstanceNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(128, 64, 3, stride=2, padding=1, output_padding=1),
+            nn.InstanceNorm2d(64),
+            nn.ReLU(inplace=True)
+        ]
+
+        # Output layer
+        model += [
+            nn.ReflectionPad2d(3),
+            nn.Conv2d(64, out_channels, 7),
+            nn.Tanh()  # Output in [-1, 1] range
+        ]
+
+        self.model = nn.Sequential(*model)
+
+    def forward(self, x):
+        return self.model(x)
 
 # ============ Predictor ============
 class Predictor(BasePredictor):
@@ -118,9 +174,16 @@ class Predictor(BasePredictor):
         self.pix2pix_gen.eval()
         print("✅ Pix2Pix loaded")
 
-        # Placeholder for CycleGAN
-        self.cyclegan_gen = None
-        print("⚠️  CycleGAN not loaded (not trained yet)")
+        # Load CycleGAN generator
+        print("📦 Loading CycleGAN generator (best checkpoint)...")
+        self.cyclegan_gen = ResNetGenerator(in_channels=3, out_channels=3).to(self.device)
+        cyclegan_checkpoint = torch.load(
+            "/src/models/cyclegan_best_dry2wet.pth",
+            map_location=self.device
+        )
+        self.cyclegan_gen.load_state_dict(cyclegan_checkpoint)
+        self.cyclegan_gen.eval()
+        print("✅ CycleGAN loaded")
 
     def predict(
         self,
@@ -151,8 +214,6 @@ class Predictor(BasePredictor):
         if model == "pix2pix":
             return self._run_pix2pix(image, alpha)
         elif model == "cyclegan":
-            if self.cyclegan_gen is None:
-                raise ValueError("CycleGAN model not available yet - training in progress")
             return self._run_cyclegan(image)
         else:
             raise ValueError(f"Unknown model: {model}")
@@ -207,5 +268,41 @@ class Predictor(BasePredictor):
         return Path(output_path)
 
     def _run_cyclegan(self, image_path: Path) -> Path:
-        """Run CycleGAN (future implementation)"""
-        raise NotImplementedError("CycleGAN not trained yet")
+        """Run CycleGAN generator"""
+        print("🔄 Running CycleGAN generator...")
+
+        # Load and preprocess (supports HEIC via pillow-heif)
+        img = Image.open(str(image_path)).convert("RGB")
+        original_size = img.size
+
+        # Resize to 512×512 for model
+        img_resized = img.resize((512, 512), Image.LANCZOS)
+
+        # To tensor, normalize to [-1, 1]
+        transform = T.Compose([
+            T.ToTensor(),
+            T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+        ])
+        img_tensor = transform(img_resized).unsqueeze(0).to(self.device)
+
+        # Generate
+        with torch.no_grad():
+            generated = self.cyclegan_gen(img_tensor)
+
+        # Denormalize [-1, 1] → [0, 1]
+        generated = (generated + 1) / 2
+        generated = generated.squeeze(0).cpu()
+
+        # To PIL
+        to_pil = T.ToPILImage()
+        generated_img = to_pil(generated)
+
+        # Resize back to original size
+        generated_img = generated_img.resize(original_size, Image.LANCZOS)
+
+        # Save output
+        output_path = "/tmp/output.jpg"
+        generated_img.save(output_path, "JPEG", quality=95)
+        print(f"✅ Saved result: {generated_img.size}")
+
+        return Path(output_path)
