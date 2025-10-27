@@ -1,0 +1,14 @@
+build:
+  gpu: true
+  cuda: "12.1"
+  python_version: "3.11"
+
+  system_packages:
+    - "libgl1-mesa-glx"
+    - "libglib2.0-0"
+
+  run:
+    - "pip install torch torchvision"
+    - "pip install pillow pillow-heif"
+
+predict: "predict.py:Predictor"
